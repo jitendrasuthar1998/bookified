@@ -74,9 +74,9 @@ export async function GET(request: Request) {
   // Get messages destined for this peer (or broadcast "all") that haven't been consumed
   let pendingMessages: SignalMessage[] = [];
   if (peerId) {
-    pendingMessages = room.messages.filter((m) => m.to === peerId && m.from !== peerId);
-    // Remove retrieved messages for this peer so they aren't delivered repeatedly
-    room.messages = room.messages.filter((m) => !(m.to === peerId && m.from !== peerId));
+    pendingMessages = room.messages.filter((m) => (m.to === peerId || m.to === "all") && m.from !== peerId);
+    // Remove retrieved messages specifically for this peer (keep general broadcasts with a consumed set if needed, or remove)
+    room.messages = room.messages.filter((m) => !((m.to === peerId || m.to === "all") && m.from !== peerId));
   }
 
   const peersList = Array.from(room.peers.values());
