@@ -22,23 +22,14 @@ import {
 } from "lucide-react";
 import { generateQrCodeDataUrl } from "@/lib/qr-code";
 
-interface Peer {
-  id: string;
-  name: string;
-  deviceType: "mac" | "android" | "windows" | "ios" | "unknown";
-  lastSeen: number;
-}
-
 interface SharedFileItem {
   id: string;
   name: string;
   size: number;
   type: string;
   senderName: string;
-  senderId: string;
-  uploadedAt: number;
-  downloadUrl?: string;
-  blobUrl?: string;
+  blobUrl: string;
+  receivedAt: number;
 }
 
 interface TransferringItem {
@@ -48,7 +39,6 @@ interface TransferringItem {
   progress: number;
   speed: string;
   status: "transferring" | "completed" | "error";
-  mode: "p2p" | "lan";
 }
 
 interface ChatMessage {
@@ -60,51 +50,48 @@ interface ChatMessage {
 
 export default function TransferPage() {
   // Device identity
-  const [peerId] = useState<string>(() =>
-    typeof window !== "undefined"
-      ? "p_" + Math.random().toString(36).substring(2, 9)
-      : "peer"
-  );
   const [deviceName, setDeviceName] = useState<string>("My Device");
   const [deviceType, setDeviceType] = useState<"mac" | "android" | "windows" | "ios" | "unknown">("unknown");
+  const [myPeerId, setMyPeerId] = useState<string>("");
 
   // Room state
-  const [roomId, setRoomId] = useState<string>("quick-room");
-  const [localIp, setLocalIp] = useState<string>("");
+  const [roomId, setRoomId] = useState<string>("room123");
   const [shareUrl, setShareUrl] = useState<string>("");
   const [qrCodeUrl, setQrCodeUrl] = useState<string>("");
   const [showQrModal, setShowQrModal] = useState<boolean>(false);
   const [copied, setCopied] = useState<boolean>(false);
 
-  // Connected Peer & WebRTC State
-  const [connectedPeer, setConnectedPeer] = useState<Peer | null>(null);
-  const [isP2PConnected, setIsP2PConnected] = useState<boolean>(false);
-  const lastSeenPeerTimeRef = useRef<number>(0);
+  // Connection State (100% P2P WebRTC via PeerJS, ZERO HTTP FETCH CALLS)
+  const [isConnected, setIsConnected] = useState<boolean>(false);
+  const [remoteDeviceName, setRemoteDeviceName] = useState<string>("Other Device");
+  const [remoteDeviceType, setRemoteDeviceType] = useState<string>("unknown");
 
-  // WebRTC References
-  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
-  const dataChannelRef = useRef<RTCDataChannel | null>(null);
-  const isInitiatingRef = useRef<boolean>(false);
+  // PeerJS instances
+  const peerInstanceRef = useRef<any>(null);
+  const connectionRef = useRef<any>(null);
 
-  // Active Receiving Buffer (In-memory P2P stream)
+  // In-memory Receiving Buffer
   const receivingFileRef = useRef<{
-    meta: any;
+    id: string;
+    name: string;
+    size: number;
+    mimeType: string;
     chunks: ArrayBuffer[];
     receivedBytes: number;
     startTime: number;
   } | null>(null);
 
-  // Files & Queue
+  // Transfers & Files
   const [transfers, setTransfers] = useState<TransferringItem[]>([]);
   const [receivedFiles, setReceivedFiles] = useState<SharedFileItem[]>([]);
   const [newFileAlert, setNewFileAlert] = useState<SharedFileItem | null>(null);
 
-  // Text / Chat
+  // Text Chat
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState<string>("");
   const [activeTab, setActiveTab] = useState<"send" | "received" | "chat">("send");
 
-  // Drag over & File ref
+  // Drag over
   const [dragOver, setDragOver] = useState<boolean>(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -134,13 +121,13 @@ export default function TransferPage() {
     } catch {}
   };
 
-  // Device & Room Detection
+  // 1. Detect User Agent
   useEffect(() => {
     if (typeof window === "undefined") return;
 
     const ua = navigator.userAgent;
     let detectedType: "mac" | "android" | "windows" | "ios" | "unknown" = "unknown";
-    let defaultName = "Web Device";
+    let defaultName = "Device";
 
     if (/Android/i.test(ua)) {
       detectedType = "android";
@@ -158,177 +145,112 @@ export default function TransferPage() {
 
     setDeviceType(detectedType);
     setDeviceName(defaultName);
-
-    const params = new URLSearchParams(window.location.search);
-    const roomParam = params.get("room");
-    if (roomParam) {
-      setRoomId(roomParam);
-    } else {
-      const generatedRoom = Math.floor(1000 + Math.random() * 9000).toString();
-      setRoomId(generatedRoom);
-      const newUrl = `${window.location.pathname}?room=${generatedRoom}`;
-      window.history.replaceState({}, "", newUrl);
-    }
   }, []);
 
-  // Fetch Host Local IP & QR Code
+  // 2. Initialize PeerJS WebRTC P2P Connection (No HTTP Polling)
   useEffect(() => {
-    async function initNetwork() {
-      try {
-        const res = await fetch("/api/transfer/network-info");
-        const data = await res.json();
-        const hostIp = data.success && data.primaryIp ? data.primaryIp : window.location.hostname;
-        const port = data.port || (window.location.port ? window.location.port : "3000");
-        const fullUrl = `http://${hostIp}:${port}/transfer?room=${roomId}`;
+    if (typeof window === "undefined") return;
 
-        setLocalIp(hostIp);
-        setShareUrl(fullUrl);
-        const qr = await generateQrCodeDataUrl(fullUrl);
-        setQrCodeUrl(qr);
-      } catch (e) {
-        const fallbackUrl = window.location.href;
-        setShareUrl(fallbackUrl);
-        generateQrCodeDataUrl(fallbackUrl).then(setQrCodeUrl);
-      }
-    }
+    let destroyed = false;
 
-    if (roomId) {
-      initNetwork();
-    }
-  }, [roomId]);
+    async function initPeerJS() {
+      const PeerModule = (await import("peerjs")).default;
 
-  // Send Signal Helper
-  const sendSignal = async (to: string, type: string, payload: any) => {
-    try {
-      await fetch("/api/transfer/signal", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          roomId,
-          from: peerId,
-          to,
-          type,
-          payload,
-        }),
+      const params = new URLSearchParams(window.location.search);
+      const urlRoom = params.get("room") || Math.floor(1000 + Math.random() * 9000).toString();
+      const targetJoinId = params.get("join");
+      setRoomId(urlRoom);
+
+      // Generate clean unique Peer ID for this room session
+      const myId = `bf-${urlRoom}-${Math.random().toString(36).substring(2, 7)}`;
+      setMyPeerId(myId);
+
+      // URL to share via QR
+      const origin = window.location.origin;
+      const fullShareUrl = `${origin}/transfer?room=${urlRoom}&join=${myId}`;
+      setShareUrl(fullShareUrl);
+      generateQrCodeDataUrl(fullShareUrl).then(setQrCodeUrl);
+
+      // Create Peer instance with STUN servers
+      const peer = new PeerModule(myId, {
+        config: {
+          iceServers: [
+            { urls: "stun:stun.l.google.com:19302" },
+            { urls: "stun:stun1.l.google.com:19302" },
+            { urls: "stun:stun2.l.google.com:19302" },
+          ],
+        },
       });
-    } catch (e) {}
-  };
 
-  // Setup WebRTC DataChannel Events
-  const setupDataChannel = (channel: RTCDataChannel) => {
-    channel.binaryType = "arraybuffer";
+      peerInstanceRef.current = peer;
 
-    channel.onopen = () => {
-      setIsP2PConnected(true);
-      dataChannelRef.current = channel;
-    };
+      // When peer is ready
+      peer.on("open", (id) => {
+        // If there's a join target in the URL (e.g. Android scanning Mac's QR)
+        if (targetJoinId && targetJoinId !== id) {
+          const conn = peer.connect(targetJoinId, {
+            reliable: true,
+          });
+          setupConnection(conn);
+        }
+      });
 
-    channel.onclose = () => {
-      setIsP2PConnected(false);
-    };
+      // When incoming P2P connection arrives (e.g. Mac receiving connection from Phone)
+      peer.on("connection", (conn) => {
+        setupConnection(conn);
+      });
 
-    channel.onmessage = (event) => {
-      if (typeof event.data === "string") {
-        try {
-          const msg = JSON.parse(event.data);
+      peer.on("error", (err) => {
+        console.warn("PeerJS notice:", err);
+      });
+    }
 
-          if (msg.type === "chat") {
-            setMessages((prev) => [
-              ...prev,
-              {
-                id: Math.random().toString(),
-                sender: msg.sender,
-                text: msg.text,
-                timestamp: Date.now(),
-              },
-            ]);
-            playChime("received");
-          } else if (msg.type === "file-start") {
-            // High-speed incoming P2P file header
-            receivingFileRef.current = {
-              meta: msg,
-              chunks: [],
-              receivedBytes: 0,
-              startTime: Date.now(),
-            };
+    // Bind event handlers to the established P2P connection
+    function setupConnection(conn: any) {
+      connectionRef.current = conn;
 
-            setTransfers((prev) => [
-              {
-                id: msg.id,
-                name: msg.name,
-                size: msg.size,
-                progress: 0,
-                speed: "Receiving via P2P...",
-                status: "transferring",
-                mode: "p2p",
-              },
-              ...prev.filter((t) => t.id !== msg.id),
-            ]);
-          } else if (msg.type === "file-end") {
-            // P2P file complete! Assemble blob instantly in memory!
-            const rec = receivingFileRef.current;
-            if (rec && rec.meta.id === msg.id) {
-              const blob = new Blob(rec.chunks as unknown as BlobPart[], {
-                type: rec.meta.mimeType || "application/octet-stream",
-              });
-              const blobUrl = URL.createObjectURL(blob);
+      conn.on("open", () => {
+        setIsConnected(true);
 
-              const item: SharedFileItem = {
-                id: rec.meta.id,
-                name: rec.meta.name,
-                size: rec.meta.size,
-                type: rec.meta.mimeType,
-                senderName: connectedPeer?.name || "Peer",
-                senderId: "remote",
-                uploadedAt: Date.now(),
-                blobUrl,
-              };
+        // Exchange handshake greeting
+        conn.send({
+          type: "handshake",
+          deviceName,
+          deviceType,
+        });
+      });
 
-              setReceivedFiles((prev) => [item, ...prev]);
-              setNewFileAlert(item);
-              playChime("received");
-              setActiveTab("received");
+      conn.on("close", () => {
+        setIsConnected(false);
+        connectionRef.current = null;
+      });
 
-              setTransfers((prev) =>
-                prev.map((t) =>
-                  t.id === msg.id
-                    ? { ...t, progress: 100, status: "completed", speed: "Received via P2P (Max Speed)" }
-                    : t
-                )
-              );
+      conn.on("data", (data: any) => {
+        handleIncomingP2PData(data, conn);
+      });
+    }
 
-              // Auto-trigger direct download to phone storage
-              const a = document.createElement("a");
-              a.href = blobUrl;
-              a.download = rec.meta.name;
-              document.body.appendChild(a);
-              a.click();
-              document.body.removeChild(a);
-
-              receivingFileRef.current = null;
-            }
-          }
-        } catch (e) {}
-      } else {
-        // Binary ArrayBuffer chunk received over WebRTC SCTP socket!
-        const chunk = event.data as ArrayBuffer;
+    // Handle high-speed P2P data packets (zero server intervention)
+    function handleIncomingP2PData(data: any, conn: any) {
+      // 1. Binary ArrayBuffer chunk (The actual file data!)
+      if (data instanceof ArrayBuffer) {
         const rec = receivingFileRef.current;
         if (rec) {
-          rec.chunks.push(chunk);
-          rec.receivedBytes += chunk.byteLength;
+          rec.chunks.push(data);
+          rec.receivedBytes += data.byteLength;
 
-          const progress = Math.min(99, Math.round((rec.receivedBytes / rec.meta.size) * 100));
+          const progress = Math.min(99, Math.round((rec.receivedBytes / rec.size) * 100));
           const elapsed = (Date.now() - rec.startTime) / 1000;
           const speedMBs = elapsed > 0 ? (rec.receivedBytes / (1024 * 1024) / elapsed).toFixed(1) : "0";
 
           setTransfers((prev) =>
             prev.map((t) =>
-              t.id === rec.meta.id
+              t.id === rec.id
                 ? {
                     ...t,
                     progress,
                     speed: `⚡ ${speedMBs} MB/s (${(rec.receivedBytes / 1024 / 1024).toFixed(1)} / ${(
-                      rec.meta.size /
+                      rec.size /
                       1024 /
                       1024
                     ).toFixed(1)} MB)`,
@@ -337,309 +259,187 @@ export default function TransferPage() {
             )
           );
         }
+        return;
       }
-    };
-  };
 
-  // Create WebRTC PeerConnection
-  const createPeerConnection = (targetPeerId: string) => {
-    if (peerConnectionRef.current) {
-      peerConnectionRef.current.close();
-    }
+      // 2. JSON control messages
+      if (typeof data === "object") {
+        if (data.type === "handshake") {
+          setRemoteDeviceName(data.deviceName || "Device");
+          setRemoteDeviceType(data.deviceType || "unknown");
+          // Reply with our identity if not sent yet
+          conn.send({
+            type: "handshake-reply",
+            deviceName,
+            deviceType,
+          });
+        } else if (data.type === "handshake-reply") {
+          setRemoteDeviceName(data.deviceName || "Device");
+          setRemoteDeviceType(data.deviceType || "unknown");
+        } else if (data.type === "chat") {
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: Math.random().toString(),
+              sender: data.sender,
+              text: data.text,
+              timestamp: Date.now(),
+            },
+          ]);
+          playChime("received");
+        } else if (data.type === "file-start") {
+          // Initialize in-memory receiver
+          receivingFileRef.current = {
+            id: data.id,
+            name: data.name,
+            size: data.size,
+            mimeType: data.mimeType || "application/octet-stream",
+            chunks: [],
+            receivedBytes: 0,
+            startTime: Date.now(),
+          };
 
-    const pc = new RTCPeerConnection({
-      iceServers: [
-        { urls: "stun:stun.l.google.com:19302" },
-        { urls: "stun:stun1.l.google.com:19302" },
-      ],
-    });
+          setTransfers((prev) => [
+            {
+              id: data.id,
+              name: data.name,
+              size: data.size,
+              progress: 0,
+              speed: "⚡ P2P Direct Stream...",
+              status: "transferring",
+            },
+            ...prev.filter((t) => t.id !== data.id),
+          ]);
+        } else if (data.type === "file-end") {
+          const rec = receivingFileRef.current;
+          if (rec && rec.id === data.id) {
+            const blob = new Blob(rec.chunks as unknown as BlobPart[], {
+              type: rec.mimeType,
+            });
+            const blobUrl = URL.createObjectURL(blob);
 
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        sendSignal(targetPeerId, "candidate", event.candidate);
-      }
-    };
+            const fileItem: SharedFileItem = {
+              id: rec.id,
+              name: rec.name,
+              size: rec.size,
+              type: rec.mimeType,
+              senderName: remoteDeviceName,
+              blobUrl,
+              receivedAt: Date.now(),
+            };
 
-    pc.ondatachannel = (event) => {
-      setupDataChannel(event.channel);
-    };
+            setReceivedFiles((prev) => [fileItem, ...prev]);
+            setNewFileAlert(fileItem);
+            playChime("received");
+            setActiveTab("received");
 
-    peerConnectionRef.current = pc;
-    return pc;
-  };
+            setTransfers((prev) =>
+              prev.map((t) =>
+                t.id === data.id
+                  ? { ...t, progress: 100, status: "completed", speed: "⚡ Received at Max Wi-Fi Speed" }
+                  : t
+              )
+            );
 
-  // Auto-Negotiate P2P Connection
-  const initiateP2P = async (target: Peer) => {
-    if (isInitiatingRef.current || isP2PConnected) return;
-    isInitiatingRef.current = true;
+            // Trigger direct download to device
+            const a = document.createElement("a");
+            a.href = blobUrl;
+            a.download = rec.name;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
 
-    try {
-      const pc = createPeerConnection(target.id);
-      const channel = pc.createDataChannel("file-transfer", {
-        ordered: true,
-      });
-      setupDataChannel(channel);
-
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      await sendSignal(target.id, "offer", offer);
-    } catch (e) {
-      isInitiatingRef.current = false;
-    }
-  };
-
-  // Handle incoming signaling messages
-  const handleSignalMessage = async (msg: any) => {
-    const { from, type, payload } = msg;
-
-    if (type === "offer") {
-      const pc = createPeerConnection(from);
-      await pc.setRemoteDescription(new RTCSessionDescription(payload));
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      await sendSignal(from, "answer", answer);
-    } else if (type === "answer") {
-      if (peerConnectionRef.current) {
-        await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(payload));
-      }
-    } else if (type === "candidate") {
-      if (peerConnectionRef.current && payload) {
-        try {
-          await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(payload));
-        } catch (e) {}
-      }
-    }
-  };
-
-  // Heartbeat & Signal Polling
-  useEffect(() => {
-    if (!roomId || !peerId) return;
-
-    let isMounted = true;
-
-    const poll = async () => {
-      try {
-        const res = await fetch(
-          `/api/transfer/signal?roomId=${roomId}&peerId=${peerId}&deviceName=${encodeURIComponent(
-            deviceName
-          )}&deviceType=${deviceType}`
-        );
-        const data = await res.json();
-
-        if (isMounted && data.success) {
-          const others: Peer[] = (data.peers || []).filter((p: Peer) => p.id !== peerId);
-
-          if (others.length > 0) {
-            const target = others[0];
-            lastSeenPeerTimeRef.current = Date.now();
-            setConnectedPeer(target);
-
-            // AUTO-CONNECT WebRTC: Deterministic initiator (smaller peerId starts offer)
-            if (!isP2PConnected && !dataChannelRef.current && peerId < target.id) {
-              initiateP2P(target);
-            }
-          } else {
-            // Grace period: only drop if no heartbeat for > 8s
-            if (Date.now() - lastSeenPeerTimeRef.current > 8000) {
-              setConnectedPeer(null);
-              setIsP2PConnected(false);
-              isInitiatingRef.current = false;
-            }
-          }
-
-          // Process incoming signals
-          if (data.messages && data.messages.length > 0) {
-            for (const msg of data.messages) {
-              await handleSignalMessage(msg);
-            }
+            receivingFileRef.current = null;
           }
         }
-      } catch (err) {}
-    };
+      }
+    }
 
-    poll();
-    const interval = setInterval(poll, 1200);
+    initPeerJS();
 
     return () => {
-      isMounted = false;
-      clearInterval(interval);
+      destroyed = true;
+      if (peerInstanceRef.current) {
+        peerInstanceRef.current.destroy();
+      }
     };
-  }, [roomId, peerId, deviceName, deviceType, isP2PConnected]);
+  }, [deviceName, deviceType]);
 
-  // ULTRA FAST DIRECT P2P TRANSFER (Streams raw ArrayBuffer directly over Wi-Fi DataChannel)
+  // HIGH-SPEED DIRECT P2P TRANSFER (NO HTTP FETCH CALLS)
   const handleSendFiles = async (files: FileList | File[]) => {
     if (!files || files.length === 0) return;
+
+    const conn = connectionRef.current;
+    if (!conn || !conn.open) {
+      alert("Please connect with the phone first by scanning the QR code!");
+      return;
+    }
+
+    const CHUNK_SIZE = 64 * 1024; // 64 KB native SCTP socket chunk size
 
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       const transferId = Math.random().toString(36).substring(2, 9);
 
-      const channel = dataChannelRef.current;
+      const newItem: TransferringItem = {
+        id: transferId,
+        name: file.name,
+        size: file.size,
+        progress: 0,
+        speed: "⚡ P2P Direct Stream...",
+        status: "transferring",
+      };
 
-      // 1. If WebRTC DataChannel is ready -> BLAZING FAST P2P! (40 - 80 MB/s)
-      if (channel && channel.readyState === "open") {
-        await streamFileWebRTC(file, transferId, channel);
-      } else {
-        // Fallback: If WebRTC not ready, try to connect or use LAN route
-        if (connectedPeer) {
-          initiateP2P(connectedPeer);
-        }
-        await streamFileLanFallback(file, transferId);
-      }
-    }
-  };
+      setTransfers((prev) => [newItem, ...prev]);
 
-  // High-Speed WebRTC Binary Streamer
-  const streamFileWebRTC = async (file: File, transferId: string, channel: RTCDataChannel) => {
-    const CHUNK_SIZE = 64 * 1024; // 64 KB optimal SCTP packet size
-    channel.bufferedAmountLowThreshold = 2 * 1024 * 1024; // 2 MB low-water mark
-
-    const newItem: TransferringItem = {
-      id: transferId,
-      name: file.name,
-      size: file.size,
-      progress: 0,
-      speed: "⚡ P2P Direct Stream...",
-      status: "transferring",
-      mode: "p2p",
-    };
-
-    setTransfers((prev) => [newItem, ...prev]);
-
-    // Send metadata header
-    channel.send(
-      JSON.stringify({
+      // 1. Send file metadata header
+      conn.send({
         type: "file-start",
         id: transferId,
         name: file.name,
         size: file.size,
         mimeType: file.type || "application/octet-stream",
-      })
-    );
+      });
 
-    let offset = 0;
-    const startTime = Date.now();
+      let offset = 0;
+      const startTime = Date.now();
 
-    while (offset < file.size) {
-      // Flow control: Wait if buffer exceeds 4MB
-      if (channel.bufferedAmount > 4 * 1024 * 1024) {
-        await new Promise<void>((resolve) => {
-          const handler = () => {
-            channel.removeEventListener("bufferedamountlow", handler);
-            resolve();
-          };
-          channel.addEventListener("bufferedamountlow", handler);
-        });
+      // Access internal raw DataChannel for zero-latency buffer checking
+      const dc = conn.dataChannel as RTCDataChannel;
+      if (dc) {
+        dc.bufferedAmountLowThreshold = 2 * 1024 * 1024; // 2MB
       }
 
-      const slice = file.slice(offset, offset + CHUNK_SIZE);
-      const arrayBuffer = await slice.arrayBuffer();
-      channel.send(arrayBuffer);
+      while (offset < file.size) {
+        // High-water mark flow control
+        if (dc && dc.bufferedAmount > 4 * 1024 * 1024) {
+          await new Promise<void>((resolve) => {
+            const onLow = () => {
+              dc.removeEventListener("bufferedamountlow", onLow);
+              resolve();
+            };
+            dc.addEventListener("bufferedamountlow", onLow);
+          });
+        }
 
-      offset += arrayBuffer.byteLength;
+        const slice = file.slice(offset, offset + CHUNK_SIZE);
+        const arrayBuffer = await slice.arrayBuffer();
 
-      const progress = Math.min(99, Math.round((offset / file.size) * 100));
-      const elapsed = (Date.now() - startTime) / 1000;
-      const speedMBs = elapsed > 0 ? (offset / (1024 * 1024) / elapsed).toFixed(1) : "0";
+        // Send raw binary ArrayBuffer straight through WebRTC P2P DataChannel!
+        conn.send(arrayBuffer);
+        offset += arrayBuffer.byteLength;
 
-      setTransfers((prev) =>
-        prev.map((t) =>
-          t.id === transferId
-            ? {
-                ...t,
-                progress,
-                speed: `⚡ ${speedMBs} MB/s (${(offset / 1024 / 1024).toFixed(1)} / ${(
-                  file.size /
-                  1024 /
-                  1024
-                ).toFixed(1)} MB)`,
-              }
-            : t
-        )
-      );
-    }
-
-    // Send end signal
-    channel.send(
-      JSON.stringify({
-        type: "file-end",
-        id: transferId,
-      })
-    );
-
-    playChime("sent");
-
-    setTransfers((prev) =>
-      prev.map((t) =>
-        t.id === transferId
-          ? {
-              ...t,
-              progress: 100,
-              status: "completed",
-              speed: "⚡ Sent via Direct P2P (Max Speed)",
-            }
-          : t
-      )
-    );
-  };
-
-  // LAN Fallback Streamer
-  const streamFileLanFallback = async (file: File, transferId: string) => {
-    const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB chunks
-    const totalChunks = Math.ceil(file.size / CHUNK_SIZE) || 1;
-
-    setTransfers((prev) => [
-      {
-        id: transferId,
-        name: file.name,
-        size: file.size,
-        progress: 0,
-        speed: "Connecting...",
-        status: "transferring",
-        mode: "lan",
-      },
-      ...prev,
-    ]);
-
-    const startTime = Date.now();
-
-    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
-      const startByte = chunkIndex * CHUNK_SIZE;
-      const endByte = Math.min(startByte + CHUNK_SIZE, file.size);
-      const chunkBlob = file.slice(startByte, endByte);
-
-      const formData = new FormData();
-      formData.append("chunk", chunkBlob);
-      formData.append("fileId", transferId);
-      formData.append("fileName", file.name);
-      formData.append("fileSize", file.size.toString());
-      formData.append("mimeType", file.type || "application/octet-stream");
-      formData.append("chunkIndex", chunkIndex.toString());
-      formData.append("totalChunks", totalChunks.toString());
-      formData.append("roomId", roomId);
-      formData.append("senderName", deviceName);
-      formData.append("senderId", peerId);
-
-      try {
-        const res = await fetch("/api/transfer/chunk", {
-          method: "POST",
-          body: formData,
-        });
-        const data = await res.json();
-        if (!data.success) throw new Error("Chunk failed");
-
-        const uploadedBytes = endByte;
-        const currentPct = Math.min(99, Math.round((uploadedBytes / file.size) * 100));
-        const elapsedSec = (Date.now() - startTime) / 1000;
-        const speedMBs = elapsedSec > 0 ? (uploadedBytes / (1024 * 1024) / elapsedSec).toFixed(1) : "0";
+        const progress = Math.min(99, Math.round((offset / file.size) * 100));
+        const elapsed = (Date.now() - startTime) / 1000;
+        const speedMBs = elapsed > 0 ? (offset / (1024 * 1024) / elapsed).toFixed(1) : "0";
 
         setTransfers((prev) =>
           prev.map((t) =>
             t.id === transferId
               ? {
                   ...t,
-                  progress: currentPct,
-                  speed: `${speedMBs} MB/s (${(uploadedBytes / 1024 / 1024).toFixed(1)} / ${(
+                  progress,
+                  speed: `⚡ ${speedMBs} MB/s (${(offset / 1024 / 1024).toFixed(1)} / ${(
                     file.size /
                     1024 /
                     1024
@@ -648,27 +448,32 @@ export default function TransferPage() {
               : t
           )
         );
-      } catch (err) {
-        break;
       }
-    }
 
-    playChime("sent");
-    setTransfers((prev) =>
-      prev.map((t) =>
-        t.id === transferId
-          ? {
-              ...t,
-              progress: 100,
-              status: "completed",
-              speed: "Sent via Local Wi-Fi",
-            }
-          : t
-      )
-    );
+      // 2. Notify receiver file is finished
+      conn.send({
+        type: "file-end",
+        id: transferId,
+      });
+
+      playChime("sent");
+
+      setTransfers((prev) =>
+        prev.map((t) =>
+          t.id === transferId
+            ? {
+                ...t,
+                progress: 100,
+                status: "completed",
+                speed: "⚡ Sent via Direct P2P (Max Speed)",
+              }
+            : t
+        )
+      );
+    }
   };
 
-  // Send Text Message
+  // Send Text Message over P2P DataChannel
   const handleSendMessage = (e: React.FormEvent) => {
     e.preventDefault();
     if (!chatInput.trim()) return;
@@ -685,18 +490,13 @@ export default function TransferPage() {
     setChatInput("");
     playChime("sent");
 
-    // Send via P2P DataChannel if open
-    if (dataChannelRef.current && dataChannelRef.current.readyState === "open") {
-      dataChannelRef.current.send(
-        JSON.stringify({
-          type: "chat",
-          sender: deviceName,
-          text,
-        })
-      );
-    } else {
-      // Or fallback to signal
-      sendSignal("all", "text-message", { sender: deviceName, text });
+    const conn = connectionRef.current;
+    if (conn && conn.open) {
+      conn.send({
+        type: "chat",
+        sender: deviceName,
+        text,
+      });
     }
   };
 
@@ -761,7 +561,7 @@ export default function TransferPage() {
 
               <div className="flex flex-col gap-2 pt-2">
                 <a
-                  href={newFileAlert.blobUrl || newFileAlert.downloadUrl}
+                  href={newFileAlert.blobUrl}
                   download={newFileAlert.name}
                   onClick={() => setNewFileAlert(null)}
                   className="w-full py-3.5 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-base flex items-center justify-center gap-2 shadow-lg shadow-emerald-600/30 transition-all active:scale-95"
@@ -801,31 +601,31 @@ export default function TransferPage() {
 
               {/* Status Arrow */}
               <div className="flex flex-col items-center">
-                <ArrowRightLeft className={`w-4 h-4 ${connectedPeer ? "text-emerald-400 animate-pulse" : "text-slate-500"}`} />
+                <ArrowRightLeft className={`w-4 h-4 ${isConnected ? "text-emerald-400 animate-pulse" : "text-slate-500"}`} />
               </div>
 
               {/* Connected Device */}
               <div
                 className={`flex items-center gap-2.5 px-4 py-2.5 rounded-2xl border transition-all duration-300 ${
-                  connectedPeer
-                    ? "bg-emerald-500/10 border-emerald-500/40 text-emerald-400"
+                  isConnected
+                    ? "bg-emerald-500/10 border-emerald-500/40 text-emerald-400 shadow-md shadow-emerald-500/10"
                     : "bg-slate-800/50 border-slate-700/50 text-slate-500"
                 }`}
               >
                 <div>
-                  {connectedPeer ? getDeviceIcon(connectedPeer.deviceType, "w-5 h-5 text-emerald-400") : <Wifi className="w-5 h-5" />}
+                  {isConnected ? getDeviceIcon(remoteDeviceType, "w-5 h-5 text-emerald-400") : <Wifi className="w-5 h-5" />}
                 </div>
                 <div>
                   <span className="text-[10px] uppercase font-bold block flex items-center gap-1">
-                    {connectedPeer ? "Connected" : "Waiting"}
-                    {isP2PConnected && (
-                      <span className="text-amber-400 font-extrabold flex items-center">
+                    {isConnected ? "Connected" : "Waiting"}
+                    {isConnected && (
+                      <span className="text-amber-400 font-extrabold flex items-center ml-1">
                         <Zap className="w-3 h-3 fill-amber-400" /> P2P Turbo
                       </span>
                     )}
                   </span>
                   <span className="text-xs font-semibold truncate max-w-[130px] block text-white">
-                    {connectedPeer ? connectedPeer.name : "Scan QR to Pair"}
+                    {isConnected ? remoteDeviceName : "Scan QR to Pair"}
                   </span>
                 </div>
               </div>
@@ -852,18 +652,16 @@ export default function TransferPage() {
           </div>
 
           {/* Speed Indicator Banner */}
-          {isP2PConnected && (
-            <div className="mt-4 px-4 py-2 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-xs text-emerald-300 flex items-center justify-between">
+          {isConnected ? (
+            <div className="mt-4 px-4 py-2.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-xs text-emerald-300 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Zap className="w-4 h-4 text-emerald-400 fill-emerald-400 animate-pulse" />
                 <span>
-                  <strong>Direct WebRTC P2P Active:</strong> Files transfer directly device-to-device at full Wi-Fi speed (30–80+ MB/s).
+                  <strong>Direct WebRTC P2P Active:</strong> Zero server latency, zero API calls. Data transfers directly device-to-device at full Wi-Fi speed (30–80+ MB/s).
                 </span>
               </div>
             </div>
-          )}
-
-          {!connectedPeer && (
+          ) : (
             <div className="mt-4 p-3 rounded-xl bg-indigo-500/10 border border-indigo-500/20 text-xs text-indigo-300 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <span className="w-2 h-2 rounded-full bg-indigo-400 animate-ping" />
@@ -887,7 +685,7 @@ export default function TransferPage() {
             }`}
           >
             <FolderUp className="w-4 h-4" />
-            📤 Send Files to {connectedPeer ? connectedPeer.name : "Device"}
+            📤 Send Files to {isConnected ? remoteDeviceName : "Device"}
           </button>
 
           <button
@@ -957,7 +755,7 @@ export default function TransferPage() {
                 Tap here to Select Files or Drop them here
               </h2>
               <p className="text-xs sm:text-sm text-slate-400 mt-2">
-                Send Photos, Videos, PDFs, APKs, or Folders to <strong className="text-indigo-400">{connectedPeer ? connectedPeer.name : "Connected Device"}</strong>
+                Send Photos, Videos, PDFs, APKs, or Folders to <strong className="text-indigo-400">{isConnected ? remoteDeviceName : "Connected Device"}</strong>
               </p>
               
               <div className="mt-6 inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs sm:text-sm font-semibold shadow-lg shadow-indigo-600/30">
@@ -1058,7 +856,7 @@ export default function TransferPage() {
                     </div>
 
                     <a
-                      href={file.blobUrl || file.downloadUrl}
+                      href={file.blobUrl}
                       download={file.name}
                       className="px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs flex items-center justify-center gap-1.5 shrink-0 shadow-md transition-all active:scale-95"
                     >
@@ -1076,7 +874,7 @@ export default function TransferPage() {
           <div className="rounded-3xl bg-slate-900 border border-slate-800 p-6 flex flex-col h-[460px] space-y-4">
             <div className="flex items-center justify-between pb-2 border-b border-slate-800 text-xs">
               <span className="font-bold text-white">Instant Text & Clipboard Sharing</span>
-              <span className="text-slate-400">Syncs between Mac & Phone</span>
+              <span className="text-slate-400">Syncs directly between Mac & Phone</span>
             </div>
 
             <div className="flex-1 overflow-y-auto space-y-3 pr-1 text-xs">
@@ -1183,7 +981,7 @@ export default function TransferPage() {
             </div>
 
             <p className="text-[11px] text-slate-500">
-              Room: <strong className="text-slate-300">#{roomId}</strong> • IP: {localIp}
+              Room: <strong className="text-slate-300">#{roomId}</strong>
             </p>
           </div>
         </div>
