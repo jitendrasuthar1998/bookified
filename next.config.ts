@@ -10,16 +10,7 @@ const nextConfig: NextConfig = {
         ignoreBuildErrors: true,
     },
     images: {
-        localPatterns: [
-            {
-                pathname: '/api/blob-proxy',
-                search: '?**',
-            },
-            {
-                pathname: '/api/**',
-                search: '?**',
-            },
-        ],
+        unoptimized: true,
         remotePatterns: [
             { protocol: 'https', hostname: 'covers.openlibrary.org' },
             { protocol: 'https', hostname: '**.blob.vercel-storage.com' },
