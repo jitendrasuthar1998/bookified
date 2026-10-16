@@ -152,25 +152,34 @@ export const saveBookSegments = async (bookId: string, clerkId: string, segments
 
         const { getEmbedding } = await import("@/lib/embedding");
 
-        // Generate vector embeddings for segments
-        const segmentsToInsert = await Promise.all(
-            segments.map(async ({ text, segmentIndex, pageNumber, wordCount }) => {
-                let embedding: number[] | undefined;
-                try {
-                    const emb = await getEmbedding(text);
-                    if (emb && emb.length > 0) embedding = emb;
-                } catch {}
-                return {
-                    clerkId,
-                    bookId,
-                    content: text,
-                    segmentIndex,
-                    pageNumber,
-                    wordCount,
-                    embedding,
-                };
-            })
-        );
+        // Generate vector embeddings for segments in controlled batches to avoid API rate limits
+        const BATCH_SIZE = 5;
+        const segmentsToInsert: any[] = [];
+
+        for (let i = 0; i < segments.length; i += BATCH_SIZE) {
+            const batch = segments.slice(i, i + BATCH_SIZE);
+            const batchResults = await Promise.all(
+                batch.map(async ({ text, segmentIndex, pageNumber, wordCount }) => {
+                    let embedding: number[] | undefined;
+                    try {
+                        const emb = await getEmbedding(text);
+                        if (emb && emb.length > 0) embedding = emb;
+                    } catch (embErr) {
+                        console.warn(`Embedding failed for segment ${segmentIndex}:`, embErr);
+                    }
+                    return {
+                        clerkId,
+                        bookId,
+                        content: text,
+                        segmentIndex,
+                        pageNumber,
+                        wordCount,
+                        embedding,
+                    };
+                })
+            );
+            segmentsToInsert.push(...batchResults);
+        }
 
         await BookSegment.insertMany(segmentsToInsert);
 

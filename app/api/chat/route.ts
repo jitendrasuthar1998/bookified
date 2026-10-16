@@ -79,46 +79,54 @@ Core Rules:
                 parts: [{ text: userPrompt }],
             });
 
-            try {
-                const response = await fetch(
-                    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`,
-                    {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
-                            systemInstruction: {
-                                parts: [{ text: systemPrompt }],
-                            },
-                            contents,
-                            generationConfig: {
-                                maxOutputTokens: 600,
-                                temperature: 0.7,
-                                thinkingConfig: {
-                                    thinkingBudget: 0,
-                                },
-                            },
-                        }),
-                    }
-                );
+            const modelsToTry = [
+                "gemini-3.5-flash",
+                "gemini-3.6-flash",
+                "gemini-flash-lite-latest",
+                "gemini-3.5-flash-lite",
+            ];
 
-                if (response.ok) {
-                    const data = await response.json();
-                    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-                    if (text) {
-                        // Strip any rogue markdown formatting, bullets, or odd line breaks for clean audio reading
-                        reply = text
-                            .replace(/[*_#`~]/g, "")
-                            .replace(/^[\s•\-\*]+\s*/gm, "")
-                            .replace(/\n+/g, " ")
-                            .replace(/\s+/g, " ")
-                            .trim();
+            for (const modelName of modelsToTry) {
+                try {
+                    const response = await fetch(
+                        `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${geminiKey}`,
+                        {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({
+                                systemInstruction: {
+                                    parts: [{ text: systemPrompt }],
+                                },
+                                contents,
+                                generationConfig: {
+                                    maxOutputTokens: 600,
+                                    temperature: 0.7,
+                                    ...(modelName.includes("2.5") ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
+                                },
+                            }),
+                        }
+                    );
+
+                    if (response.ok) {
+                        const data = await response.json();
+                        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+                        if (text) {
+                            // Strip any rogue markdown formatting, bullets, or odd line breaks for clean audio reading
+                            reply = text
+                                .replace(/[*_#`~]/g, "")
+                                .replace(/^[\s•\-\*]+\s*/gm, "")
+                                .replace(/\n+/g, " ")
+                                .replace(/\s+/g, " ")
+                                .trim();
+                            break; // Successfully got response, stop trying other models
+                        }
+                    } else {
+                        const errData = await response.text();
+                        console.warn(`Model ${modelName} returned ${response.status}:`, errData.slice(0, 150));
                     }
-                } else {
-                    const errData = await response.text();
-                    console.warn("Gemini 2.5 API error:", response.status, errData);
+                } catch (apiErr) {
+                    console.error(`Gemini fetch exception on ${modelName}:`, apiErr);
                 }
-            } catch (apiErr) {
-                console.error("Gemini fetch exception:", apiErr);
             }
         }
 
