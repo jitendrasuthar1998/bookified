@@ -75,8 +75,8 @@ export async function GET(request: Request) {
   let pendingMessages: SignalMessage[] = [];
   if (peerId) {
     pendingMessages = room.messages.filter((m) => (m.to === peerId || m.to === "all") && m.from !== peerId);
-    // Remove retrieved messages specifically for this peer (keep general broadcasts with a consumed set if needed, or remove)
-    room.messages = room.messages.filter((m) => !((m.to === peerId || m.to === "all") && m.from !== peerId));
+    // Remove direct messages destined to this peer so they aren't delivered repeatedly
+    room.messages = room.messages.filter((m) => !(m.to === peerId && m.from !== peerId));
   }
 
   const peersList = Array.from(room.peers.values());
