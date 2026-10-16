@@ -150,17 +150,33 @@ export const saveBookSegments = async (bookId: string, clerkId: string, segments
     try {
         await connectToDatabase();
 
-        console.log('Saving book segments...');
+        const { getEmbedding } = await import("@/lib/embedding");
 
-        const segmentsToInsert = segments.map(({ text, segmentIndex, pageNumber, wordCount }) => ({
-            clerkId, bookId, content: text, segmentIndex, pageNumber, wordCount
-        }));
+        // Generate vector embeddings for segments
+        const segmentsToInsert = await Promise.all(
+            segments.map(async ({ text, segmentIndex, pageNumber, wordCount }) => {
+                let embedding: number[] | undefined;
+                try {
+                    const emb = await getEmbedding(text);
+                    if (emb && emb.length > 0) embedding = emb;
+                } catch {}
+                return {
+                    clerkId,
+                    bookId,
+                    content: text,
+                    segmentIndex,
+                    pageNumber,
+                    wordCount,
+                    embedding,
+                };
+            })
+        );
 
         await BookSegment.insertMany(segmentsToInsert);
 
         await Book.findByIdAndUpdate(bookId, { totalSegments: segments.length });
 
-        console.log('Book segments saved successfully.');
+        console.log('Book segments with vector embeddings saved successfully.');
 
         return {
             success: true,
@@ -176,16 +192,41 @@ export const saveBookSegments = async (bookId: string, clerkId: string, segments
     }
 }
 
-// Searches book segments using MongoDB text search with regex fallback
+// Searches book segments using Semantic Vector Search with MongoDB text/regex fallback
 export const searchBookSegments = async (bookId: string, query: string, limit: number = 5) => {
     try {
         await connectToDatabase();
-
-        console.log(`Searching for: "${query}" in book ${bookId}`);
-
         const bookObjectId = new mongoose.Types.ObjectId(bookId);
 
-        // Try MongoDB text search first (requires text index)
+        // 1. Try Semantic Vector Search (Cosine Similarity)
+        const { getEmbedding, cosineSimilarity } = await import("@/lib/embedding");
+        const queryEmbedding = await getEmbedding(query);
+
+        if (queryEmbedding) {
+            const allSegments = await BookSegment.find({ bookId: bookObjectId })
+                .select('_id bookId content segmentIndex pageNumber wordCount embedding')
+                .lean();
+
+            // If segments have embeddings, rank by cosine similarity
+            const segmentsWithEmbeddings = allSegments.filter((s: any) => s.embedding && s.embedding.length > 0);
+
+            if (segmentsWithEmbeddings.length > 0) {
+                const scored = segmentsWithEmbeddings.map((s: any) => ({
+                    ...s,
+                    similarity: cosineSimilarity(queryEmbedding, s.embedding),
+                }));
+
+                scored.sort((a: any, b: any) => b.similarity - a.similarity);
+                const topResults = scored.slice(0, limit);
+
+                return {
+                    success: true,
+                    data: serializeData(topResults),
+                };
+            }
+        }
+
+        // 2. Fallback: MongoDB text search first (requires text index)
         let segments: Record<string, unknown>[] = [];
         try {
             segments = await BookSegment.find({
@@ -197,26 +238,23 @@ export const searchBookSegments = async (bookId: string, query: string, limit: n
                 .limit(limit)
                 .lean();
         } catch {
-            // Text index may not exist — fall through to regex fallback
             segments = [];
         }
 
-        // Fallback: regex search matching ANY keyword
+        // 3. Fallback: regex search matching ANY keyword
         if (segments.length === 0) {
             const keywords = query.split(/\s+/).filter((k) => k.length > 2);
             const pattern = keywords.map(escapeRegex).join('|');
 
             segments = await BookSegment.find({
                 bookId: bookObjectId,
-                content: { $regex: pattern, $options: 'i' },
+                content: { $regex: pattern || query, $options: 'i' },
             })
                 .select('_id bookId content segmentIndex pageNumber wordCount')
                 .sort({ segmentIndex: 1 })
                 .limit(limit)
                 .lean();
         }
-
-        console.log(`Search complete. Found ${segments.length} results`);
 
         return {
             success: true,
@@ -229,5 +267,24 @@ export const searchBookSegments = async (bookId: string, query: string, limit: n
             error: (error as Error).message,
             data: [],
         };
+    }
+};
+
+export const getChatHistory = async (bookId: string, clerkId: string) => {
+    try {
+        await connectToDatabase();
+        const ChatMessage = (await import("@/database/models/chat-message.model")).default;
+        const messages = await ChatMessage.find({ bookId, clerkId })
+            .sort({ createdAt: 1 })
+            .limit(50)
+            .lean();
+
+        return {
+            success: true,
+            data: serializeData(messages.map((m: any) => ({ role: m.role, content: m.content }))),
+        };
+    } catch (e) {
+        console.error("Error fetching chat history:", e);
+        return { success: false, data: [] };
     }
 };

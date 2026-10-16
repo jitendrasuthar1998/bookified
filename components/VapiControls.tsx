@@ -10,8 +10,10 @@ import {toast} from "sonner";
 import {useRouter} from "next/navigation";
 import {useEffect} from "react";
 
-const VapiControls = ({ book }: { book: IBook }) => {
-    const { status, isActive, messages, currentMessage, currentUserMessage, duration, start, stop, clearError, limitError, isBillingError, maxDurationSeconds } = useVapi(book)
+import { Messages } from "@/types";
+
+const VapiControls = ({ book, initialMessages = [] }: { book: IBook; initialMessages?: Messages[] }) => {
+    const { status, isActive, messages, currentMessage, currentUserMessage, duration, start, stop, clearError, limitError, isBillingError, maxDurationSeconds } = useVapi(book, initialMessages)
     const router = useRouter();
 
     useEffect(() => {

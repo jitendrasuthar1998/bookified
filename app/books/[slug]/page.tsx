@@ -26,6 +26,9 @@ export default async function BookDetailsPage({
   }
 
   const book = result.data;
+  const { getChatHistory } = await import("@/lib/actions/book.actions");
+  const historyResult = await getChatHistory(book._id, userId);
+  const initialMessages = historyResult.success ? historyResult.data || [] : [];
 
   return (
     <div className="book-page-container">
@@ -33,7 +36,7 @@ export default async function BookDetailsPage({
         <ArrowLeft className="size-6 text-[#212a3b]" />
       </Link>
 
-      <VapiControls book={book} />
+      <VapiControls book={book} initialMessages={initialMessages} />
     </div>
   );
 }
