@@ -33,6 +33,7 @@ export interface IBookSegment extends Document {
     segmentIndex: number;
     pageNumber?: number;
     wordCount: number;
+    embedding?: number[];
     createdAt: Date;
     updatedAt: Date;
 }

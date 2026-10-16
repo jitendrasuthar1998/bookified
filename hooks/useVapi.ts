@@ -16,12 +16,12 @@ export function useLatestRef<T>(value: T) {
     return ref;
 }
 
-export function useVapi(book: IBook) {
+export function useVapi(book: IBook, initialMessages: Messages[] = []) {
     const { userId } = useAuth();
     const { limits } = useSubscription();
 
     const [status, setStatus] = useState<CallStatus>('idle');
-    const [messages, setMessages] = useState<Messages[]>([]);
+    const [messages, setMessages] = useState<Messages[]>(initialMessages);
     const [currentMessage, setCurrentMessage] = useState('');
     const [currentUserMessage, setCurrentUserMessage] = useState('');
     const [duration, setDuration] = useState(0);
@@ -32,8 +32,11 @@ export function useVapi(book: IBook) {
     const startTimeRef = useRef<number | null>(null);
     const sessionIdRef = useRef<string | null>(null);
     const isStoppingRef = useRef(false);
+    const isSpeakingRef = useRef(false);
     const recognitionRef = useRef<any>(null);
+    const activeUtterancesRef = useRef<SpeechSynthesisUtterance[]>([]);
     const messagesRef = useLatestRef(messages);
+    const statusRef = useLatestRef(status);
 
     const maxDurationSeconds = limits?.maxDurationPerSession ? limits.maxDurationPerSession * 60 : 15 * 60;
     const maxDurationRef = useLatestRef(maxDurationSeconds);
@@ -56,47 +59,105 @@ export function useVapi(book: IBook) {
         return preferred || voices.find(v => v.lang.startsWith('en')) || voices[0] || null;
     }, [book.persona]);
 
-    // Speak a sentence using SpeechSynthesis
+    // Speak sentences using SpeechSynthesis queue (prevents Chrome GC bug and 14s stall)
     const speakText = useCallback((text: string, onEnd?: () => void) => {
         if (typeof window === 'undefined' || !window.speechSynthesis) {
             onEnd?.();
             return;
         }
 
-        window.speechSynthesis.cancel(); // Stop any previous speech
+        // 1. Mark speaking state and strictly disable recognition so microphone never hears speakers
+        isSpeakingRef.current = true;
+        if (recognitionRef.current) {
+            try {
+                recognitionRef.current.onend = null;
+                recognitionRef.current.onerror = null;
+                recognitionRef.current.abort();
+            } catch {}
+            recognitionRef.current = null;
+        }
+
+        window.speechSynthesis.cancel();
+        activeUtterancesRef.current = [];
+
         setStatus('speaking');
         setCurrentMessage(text);
 
-        const utterance = new SpeechSynthesisUtterance(text);
+        // 2. Break into natural sentences to avoid Chrome speech pause/stall bug
+        const sentences = text
+            .match(/[^.!?]+[.!?]+|\S[^.!?]*$/g)
+            ?.map(s => s.trim())
+            .filter(Boolean) || [text];
+
+        let index = 0;
         const voice = getBestVoice();
-        if (voice) utterance.voice = voice;
-        utterance.rate = 1.0;
-        utterance.pitch = 1.0;
 
-        utterance.onend = () => {
-            if (isStoppingRef.current) return;
-            setCurrentMessage('');
-            setMessages(prev => {
-                const isDupe = prev.some(m => m.role === 'assistant' && m.content === text);
-                return isDupe ? prev : [...prev, { role: 'assistant', content: text }];
-            });
-            onEnd?.();
-        };
+        const speakNext = () => {
+            if (isStoppingRef.current || !isSpeakingRef.current) return;
 
-        utterance.onerror = (e) => {
-            console.warn('SpeechSynthesis error:', e);
-            if (!isStoppingRef.current) {
+            if (index >= sentences.length) {
+                // All sentences completed
+                isSpeakingRef.current = false;
+                activeUtterancesRef.current = [];
+                (window as any).__activeUtterance = null;
                 setCurrentMessage('');
-                onEnd?.();
+                setMessages(prev => {
+                    const isDupe = prev.some(m => m.role === 'assistant' && m.content === text);
+                    return isDupe ? prev : [...prev, { role: 'assistant', content: text }];
+                });
+
+                // Wait 400ms for room echo / speaker reverb to dissipate before opening mic
+                setTimeout(() => {
+                    if (!isStoppingRef.current && !isSpeakingRef.current) {
+                        onEnd?.();
+                    }
+                }, 400);
+                return;
             }
+
+            const sentence = sentences[index];
+            index++;
+
+            const utterance = new SpeechSynthesisUtterance(sentence);
+            if (voice) utterance.voice = voice;
+            utterance.rate = 1.0;
+            utterance.pitch = 1.0;
+
+            // Retain reference to prevent Chrome garbage-collection pause
+            activeUtterancesRef.current.push(utterance);
+            (window as any).__activeUtterance = utterance;
+
+            utterance.onend = () => {
+                if (isStoppingRef.current) return;
+                speakNext();
+            };
+
+            utterance.onerror = (e) => {
+                console.warn('SpeechSynthesis sentence error:', e);
+                if (!isStoppingRef.current) {
+                    speakNext();
+                }
+            };
+
+            window.speechSynthesis.speak(utterance);
         };
 
-        window.speechSynthesis.speak(utterance);
+        speakNext();
     }, [getBestVoice]);
 
     // Send user message to /api/chat and speak response
     const handleUserSpeech = useCallback(async (userText: string) => {
         if (!userText.trim() || isStoppingRef.current) return;
+
+        // Disconnect speech recognition while thinking and generating answer
+        if (recognitionRef.current) {
+            try {
+                recognitionRef.current.onend = null;
+                recognitionRef.current.onerror = null;
+                recognitionRef.current.abort();
+            } catch {}
+            recognitionRef.current = null;
+        }
 
         setStatus('thinking');
         setCurrentUserMessage('');
@@ -121,7 +182,7 @@ export function useVapi(book: IBook) {
 
             if (!isStoppingRef.current) {
                 speakText(reply, () => {
-                    if (!isStoppingRef.current) {
+                    if (!isStoppingRef.current && !isSpeakingRef.current) {
                         startListening();
                     }
                 });
@@ -129,7 +190,7 @@ export function useVapi(book: IBook) {
         } catch (err) {
             console.error('Chat error:', err);
             speakText("I had a little trouble finding that in the book. Could you try asking again?", () => {
-                if (!isStoppingRef.current) {
+                if (!isStoppingRef.current && !isSpeakingRef.current) {
                     startListening();
                 }
             });
@@ -138,7 +199,7 @@ export function useVapi(book: IBook) {
 
     // Start browser microphone speech recognition
     const startListening = useCallback(() => {
-        if (isStoppingRef.current || typeof window === 'undefined') return;
+        if (isStoppingRef.current || isSpeakingRef.current || typeof window === 'undefined') return;
 
         const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
         if (!SpeechRecognition) {
@@ -149,7 +210,12 @@ export function useVapi(book: IBook) {
 
         try {
             if (recognitionRef.current) {
-                recognitionRef.current.abort();
+                try {
+                    recognitionRef.current.onend = null;
+                    recognitionRef.current.onerror = null;
+                    recognitionRef.current.abort();
+                } catch {}
+                recognitionRef.current = null;
             }
 
             const recognition = new SpeechRecognition();
@@ -158,12 +224,14 @@ export function useVapi(book: IBook) {
             recognition.lang = 'en-US';
 
             recognition.onstart = () => {
-                if (!isStoppingRef.current) {
+                if (!isStoppingRef.current && !isSpeakingRef.current) {
                     setStatus('listening');
                 }
             };
 
             recognition.onresult = (event: any) => {
+                if (isSpeakingRef.current || isStoppingRef.current) return;
+
                 let interim = '';
                 let final = '';
 
@@ -179,17 +247,22 @@ export function useVapi(book: IBook) {
                     setCurrentUserMessage(interim);
                 }
 
-                if (final) {
-                    recognition.stop();
-                    handleUserSpeech(final);
+                if (final.trim()) {
+                    try {
+                        recognition.onend = null;
+                        recognition.onerror = null;
+                        recognition.stop();
+                    } catch {}
+                    handleUserSpeech(final.trim());
                 }
             };
 
             recognition.onerror = (event: any) => {
+                if (isSpeakingRef.current || isStoppingRef.current) return;
                 if (event.error === 'no-speech') {
                     // Timeout with no speech -> restart listening if still active
-                    if (!isStoppingRef.current && status === 'listening') {
-                        setTimeout(() => startListening(), 500);
+                    if (!isStoppingRef.current && !isSpeakingRef.current) {
+                        setTimeout(() => startListening(), 400);
                     }
                 } else if (event.error !== 'aborted') {
                     console.warn('Recognition error:', event.error);
@@ -197,9 +270,9 @@ export function useVapi(book: IBook) {
             };
 
             recognition.onend = () => {
-                // If it ended naturally without final result and still supposed to listen
-                if (!isStoppingRef.current && status === 'listening') {
-                    setTimeout(() => startListening(), 300);
+                // If it ended naturally without final result and we are still in listening state
+                if (!isStoppingRef.current && !isSpeakingRef.current && statusRef.current === 'listening') {
+                    setTimeout(() => startListening(), 400);
                 }
             };
 
@@ -208,20 +281,27 @@ export function useVapi(book: IBook) {
         } catch (e) {
             console.error('Failed to start recognition:', e);
         }
-    }, [handleUserSpeech, status]);
+    }, [handleUserSpeech, statusRef]);
 
     const stop = useCallback(() => {
         isStoppingRef.current = true;
+        isSpeakingRef.current = false;
         setStatus('idle');
         setCurrentMessage('');
         setCurrentUserMessage('');
 
         if (typeof window !== 'undefined' && window.speechSynthesis) {
             window.speechSynthesis.cancel();
+            activeUtterancesRef.current = [];
+            (window as any).__activeUtterance = null;
         }
 
         if (recognitionRef.current) {
-            try { recognitionRef.current.abort(); } catch {}
+            try {
+                recognitionRef.current.onend = null;
+                recognitionRef.current.onerror = null;
+                recognitionRef.current.abort();
+            } catch {}
             recognitionRef.current = null;
         }
 
@@ -273,8 +353,12 @@ export function useVapi(book: IBook) {
                 }
             }, 1000);
 
-            // Greet user and then start listening
-            const greeting = `Hey, good to meet you! Have you read ${book.title} yet, or are we diving in for the first time?`;
+            // Greet user based on whether they have previous conversation history
+            const hasHistory = messagesRef.current.length > 0;
+            const greeting = hasHistory
+                ? `Welcome back to ${book.title}! What would you like to explore next?`
+                : `Hey, good to meet you! Have you read ${book.title} yet, or are we diving in for the first time?`;
+
             speakText(greeting, () => {
                 if (!isStoppingRef.current) {
                     startListening();
