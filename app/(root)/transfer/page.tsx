@@ -76,7 +76,7 @@ export default function TransferPage() {
     name: string;
     size: number;
     mimeType: string;
-    chunks: ArrayBuffer[];
+    chunks: BlobPart[];
     receivedBytes: number;
     startTime: number;
   } | null>(null);
@@ -232,12 +232,33 @@ export default function TransferPage() {
 
     // Handle high-speed P2P data packets (zero server intervention)
     function handleIncomingP2PData(data: any, conn: any) {
-      // 1. Binary ArrayBuffer chunk (The actual file data!)
-      if (data instanceof ArrayBuffer) {
+      // 1. Binary chunk detection (Handles ArrayBuffer, Uint8Array, and TypedArray from PeerJS msgpack)
+      const isBinary =
+        data instanceof ArrayBuffer ||
+        data instanceof Uint8Array ||
+        ArrayBuffer.isView(data) ||
+        (data && typeof data === "object" && data.byteLength !== undefined && !data.type);
+
+      if (isBinary) {
         const rec = receivingFileRef.current;
         if (rec) {
-          rec.chunks.push(data);
-          rec.receivedBytes += data.byteLength;
+          let chunkPart: BlobPart;
+          let byteLen = 0;
+
+          if (data instanceof ArrayBuffer) {
+            chunkPart = data;
+            byteLen = data.byteLength;
+          } else if (ArrayBuffer.isView(data)) {
+            // Uint8Array or other TypedArray view
+            chunkPart = (data.buffer as ArrayBuffer).slice(data.byteOffset, data.byteOffset + data.byteLength);
+            byteLen = data.byteLength;
+          } else {
+            chunkPart = data;
+            byteLen = data.byteLength || 0;
+          }
+
+          rec.chunks.push(chunkPart);
+          rec.receivedBytes += byteLen;
 
           const progress = Math.min(99, Math.round((rec.receivedBytes / rec.size) * 100));
           const elapsed = (Date.now() - rec.startTime) / 1000;
@@ -375,7 +396,7 @@ export default function TransferPage() {
       return;
     }
 
-    const CHUNK_SIZE = 64 * 1024; // 64 KB native SCTP socket chunk size
+    const CHUNK_SIZE = 32 * 1024; // 32 KB chunk size for maximum SCTP reliability on mobile
 
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
@@ -386,7 +407,7 @@ export default function TransferPage() {
         name: file.name,
         size: file.size,
         progress: 0,
-        speed: "⚡ P2P Direct Stream...",
+        speed: "⚡ Starting P2P Stream...",
         status: "transferring",
       };
 
@@ -407,18 +428,24 @@ export default function TransferPage() {
       // Access internal raw DataChannel for zero-latency buffer checking
       const dc = conn.dataChannel as RTCDataChannel;
       if (dc) {
-        dc.bufferedAmountLowThreshold = 2 * 1024 * 1024; // 2MB
+        dc.bufferedAmountLowThreshold = 256 * 1024; // 256 KB low water mark
       }
 
       while (offset < file.size) {
-        // High-water mark flow control
-        if (dc && dc.bufferedAmount > 4 * 1024 * 1024) {
+        // High-water mark flow control: prevent SCTP queue overflow on mobile
+        if (dc && dc.bufferedAmount > 1024 * 1024) {
           await new Promise<void>((resolve) => {
+            let done = false;
             const onLow = () => {
-              dc.removeEventListener("bufferedamountlow", onLow);
-              resolve();
+              if (!done) {
+                done = true;
+                dc.removeEventListener("bufferedamountlow", onLow);
+                resolve();
+              }
             };
             dc.addEventListener("bufferedamountlow", onLow);
+            // Fallback timeout in case event is missed
+            setTimeout(onLow, 25);
           });
         }
 
